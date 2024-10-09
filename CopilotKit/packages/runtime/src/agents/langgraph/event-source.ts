@@ -1,12 +1,14 @@
-import { ReplaySubject, scan, mergeMap } from "rxjs";
+import { ReplaySubject, scan, mergeMap, catchError } from "rxjs";
 import { LangGraphEvent, LangGraphEventTypes } from "./events";
 import { RuntimeEvent, RuntimeEventTypes } from "../../service-adapters/events";
+import { randomId } from "@copilotkit/shared";
 
 interface LangGraphEventWithState {
   event: LangGraphEvent | null;
   toolCallName: string | null;
   toolCallId: string | null;
-  prevToolCallId: string | null;
+  toolCallMessageId: string | null;
+  prevToolCallMessageId: string | null;
   messageId: string | null;
   prevMessageId: string | null;
 }
@@ -48,51 +50,77 @@ export class RemoteLangGraphEventSource {
         });
     }
 
-    while (true) {
-      const { done, value } = await reader.read();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
 
-      if (!done) {
-        buffer.push(decoder.decode(value, { stream: true }));
+        if (!done) {
+          buffer.push(decoder.decode(value, { stream: true }));
+        }
+
+        flushBuffer();
+
+        if (done) {
+          break;
+        }
       }
-
-      flushBuffer();
-
-      if (done) {
-        break;
-      }
+    } catch (error) {
+      console.error("Error in stream", error);
+      eventStream$.error(error);
+      return;
     }
     eventStream$.complete();
   }
 
+  private shouldEmitToolCall(
+    shouldEmitToolCalls: string | string[] | boolean,
+    toolCallName: string,
+  ) {
+    if (typeof shouldEmitToolCalls === "boolean") {
+      return shouldEmitToolCalls;
+    }
+    if (Array.isArray(shouldEmitToolCalls)) {
+      return shouldEmitToolCalls.includes(toolCallName);
+    }
+    return shouldEmitToolCalls === toolCallName;
+  }
+
   processLangGraphEvents() {
+    let lastEventWithState: LangGraphEventWithState | null = null;
+
     return this.eventStream$.pipe(
       scan(
         (acc, event) => {
           if (event.event === LangGraphEventTypes.OnChatModelStream) {
             if (event.data?.chunk?.kwargs?.tool_call_chunks) {
-              acc.prevToolCallId = acc.toolCallId;
-              acc.toolCallId = event.data.chunk.kwargs?.id;
+              acc.prevToolCallMessageId = acc.toolCallMessageId;
+              acc.toolCallMessageId = event.data.chunk.kwargs?.id;
               if (event.data.chunk.kwargs.tool_call_chunks[0]?.name) {
                 acc.toolCallName = event.data.chunk.kwargs.tool_call_chunks[0].name;
+              }
+              if (event.data.chunk.kwargs.tool_call_chunks[0]?.id) {
+                acc.toolCallId = event.data.chunk.kwargs.tool_call_chunks[0].id;
               }
             }
             acc.prevMessageId = acc.messageId;
             acc.messageId = event.data?.chunk?.kwargs?.id;
           } else {
-            acc.prevToolCallId = acc.toolCallId;
-            acc.toolCallId = null;
+            acc.prevToolCallMessageId = acc.toolCallMessageId;
+            acc.toolCallMessageId = null;
             acc.prevMessageId = acc.messageId;
             acc.messageId = null;
             acc.toolCallName = null;
           }
 
           acc.event = event;
+          lastEventWithState = acc; // Capture the state
           return acc;
         },
         {
           event: null,
           toolCallId: null,
-          prevToolCallId: null,
+          toolCallMessageId: null,
+          prevToolCallMessageId: null,
           messageId: null,
           toolCallName: null,
           prevMessageId: null,
@@ -102,7 +130,7 @@ export class RemoteLangGraphEventSource {
         const events: RuntimeEvent[] = [];
 
         let shouldEmitMessages = true;
-        let shouldEmitToolCalls = false;
+        let shouldEmitToolCalls: string | string[] | boolean = false;
 
         if (eventWithState.event.event == LangGraphEventTypes.OnChatModelStream) {
           if ("copilotkit:emit-tool-calls" in (eventWithState.event.metadata || {})) {
@@ -115,9 +143,9 @@ export class RemoteLangGraphEventSource {
 
         // Tool call ended: emit ActionExecutionEnd
         if (
-          eventWithState.prevToolCallId !== null &&
-          eventWithState.prevToolCallId !== eventWithState.toolCallId &&
-          shouldEmitToolCalls
+          eventWithState.prevToolCallMessageId !== null &&
+          eventWithState.prevToolCallMessageId !== eventWithState.toolCallMessageId &&
+          this.shouldEmitToolCall(shouldEmitToolCalls, eventWithState.toolCallName)
         ) {
           events.push({
             type: RuntimeEventTypes.ActionExecutionEnd,
@@ -147,6 +175,20 @@ export class RemoteLangGraphEventSource {
             });
             events.push({
               type: RuntimeEventTypes.TextMessageEnd,
+            });
+            break;
+          case LangGraphEventTypes.OnCopilotKitEmitToolCall:
+            events.push({
+              type: RuntimeEventTypes.ActionExecutionStart,
+              actionExecutionId: eventWithState.event.id,
+              actionName: eventWithState.event.name,
+            });
+            events.push({
+              type: RuntimeEventTypes.ActionExecutionArgs,
+              args: JSON.stringify(eventWithState.event.args),
+            });
+            events.push({
+              type: RuntimeEventTypes.ActionExecutionEnd,
             });
             break;
           case LangGraphEventTypes.OnCopilotKitStateSync:
@@ -180,13 +222,13 @@ export class RemoteLangGraphEventSource {
             break;
           case LangGraphEventTypes.OnChatModelStream:
             if (
-              eventWithState.toolCallId !== null &&
-              eventWithState.prevToolCallId !== eventWithState.toolCallId
+              eventWithState.toolCallMessageId !== null &&
+              eventWithState.prevToolCallMessageId !== eventWithState.toolCallMessageId
             ) {
-              if (shouldEmitToolCalls) {
+              if (this.shouldEmitToolCall(shouldEmitToolCalls, eventWithState.toolCallName)) {
                 events.push({
                   type: RuntimeEventTypes.ActionExecutionStart,
-                  actionExecutionId: eventWithState.toolCallId,
+                  actionExecutionId: eventWithState.toolCallMessageId,
                   actionName: eventWithState.toolCallName,
                   scope: "client",
                 });
@@ -210,7 +252,7 @@ export class RemoteLangGraphEventSource {
 
             // Tool call args: emit ActionExecutionArgs
             if (args) {
-              if (shouldEmitToolCalls) {
+              if (this.shouldEmitToolCall(shouldEmitToolCalls, eventWithState.toolCallName)) {
                 events.push({
                   type: RuntimeEventTypes.ActionExecutionArgs,
                   args,
@@ -228,6 +270,37 @@ export class RemoteLangGraphEventSource {
             }
             break;
         }
+        return events;
+      }),
+      catchError((error) => {
+        console.error(error);
+        const events: RuntimeEvent[] = [];
+
+        if (lastEventWithState?.messageId) {
+          events.push({
+            type: RuntimeEventTypes.TextMessageEnd,
+          });
+        }
+        if (lastEventWithState?.toolCallMessageId) {
+          events.push({
+            type: RuntimeEventTypes.ActionExecutionEnd,
+          });
+        }
+
+        const messageId = randomId();
+
+        events.push({
+          type: RuntimeEventTypes.TextMessageStart,
+          messageId: messageId,
+        });
+        events.push({
+          type: RuntimeEventTypes.TextMessageContent,
+          content: "❌ An error occurred. Please try again.",
+        });
+        events.push({
+          type: RuntimeEventTypes.TextMessageEnd,
+        });
+
         return events;
       }),
     );

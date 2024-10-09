@@ -4,8 +4,7 @@ It defines the workflow graph and the entry point for the agent.
 """
 # pylint: disable=line-too-long, unused-import
 
-import json
-from typing import cast, TypedDict
+from typing import cast, TypedDict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, ToolMessage, AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -30,7 +29,8 @@ async def translate_node(state: AgentState, config: RunnableConfig):
 
     config = copilotkit_customize_config(
         config,
-        emit_messages=True,
+        # config emits messages by default, so this is not needed:
+        ## emit_messages=True,
         emit_intermediate_state=[
             {
                 "state_key": "translations",
@@ -84,7 +84,7 @@ async def translate_node(state: AgentState, config: RunnableConfig):
     }
 
 workflow = StateGraph(AgentState)
-workflow.add_node("translate_node", translate_node)
+workflow.add_node("translate_node", cast(Any, translate_node))
 workflow.set_entry_point("translate_node")
 workflow.add_edge("translate_node", END)
 memory = MemorySaver()
